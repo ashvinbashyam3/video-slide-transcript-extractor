@@ -77,23 +77,44 @@ class SlideRegion:
         return self.width * self.height
 
 
-def compute_phash(image: np.ndarray, hash_size: int = 16) -> np.ndarray:
+def compute_phash(image: np.ndarray, hash_size: int = 16, mask_speaker: bool = False) -> np.ndarray:
     """
     Compute perceptual hash of an image using DCT (Discrete Cosine Transform).
 
     The perceptual hash algorithm:
     1. Resize image to hash_size x hash_size (default 16x16)
     2. Convert to grayscale
-    3. Apply DCT to get frequency components
-    4. Take low-frequency 8x8 block (captures image structure, ignores fine details)
-    5. Compute median and create binary hash (above/below median)
+    3. Optionally mask speaker overlay region (top-right corner)
+    4. Apply DCT to get frequency components
+    5. Take low-frequency 8x8 block (captures image structure, ignores fine details)
+    6. Compute median and create binary hash (above/below median)
 
     This is robust to:
     - Minor compression artifacts
     - Small color/brightness changes
     - Slight geometric variations
+
+    When mask_speaker=True, the top-right corner (where Zoom typically shows
+    the speaker video) is filled with gray to prevent speaker appearance from
+    affecting the hash.
     """
-    resized = cv2.resize(image, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
+    # Make a copy to avoid modifying original
+    img = image.copy()
+
+    # Mask out speaker overlay region (top-right corner, ~20% width x 25% height)
+    # This prevents speaker window from affecting slide change detection
+    if mask_speaker:
+        h, w = img.shape[:2]
+        speaker_x = int(w * 0.75)  # Right 25% of width
+        speaker_y = 0
+        speaker_h = int(h * 0.30)  # Top 30% of height
+        # Fill with mid-gray to neutralize the region
+        if len(img.shape) == 3:
+            img[speaker_y:speaker_y+speaker_h, speaker_x:w] = (128, 128, 128)
+        else:
+            img[speaker_y:speaker_y+speaker_h, speaker_x:w] = 128
+
+    resized = cv2.resize(img, (hash_size, hash_size), interpolation=cv2.INTER_AREA)
 
     if len(resized.shape) == 3:
         gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
@@ -104,6 +125,97 @@ def compute_phash(image: np.ndarray, hash_size: int = 16) -> np.ndarray:
     dct_low = dct[:8, :8]
     median = np.median(dct_low)
     return (dct_low > median).flatten()
+
+
+def is_change_in_speaker_region(img1: np.ndarray, img2: np.ndarray, threshold: float = 0.7) -> bool:
+    """
+    Check if the difference between two images is primarily in the speaker overlay region
+    (top-right corner). Returns True if >threshold of the change is in that region.
+
+    This helps filter out false positives caused by speaker window appearing/changing.
+    """
+    if img1.shape != img2.shape:
+        return False
+
+    h, w = img1.shape[:2]
+
+    # Convert to grayscale if needed
+    if len(img1.shape) == 3:
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    else:
+        gray1, gray2 = img1, img2
+
+    # Compute absolute difference
+    diff = cv2.absdiff(gray1, gray2)
+
+    # Define speaker region (top-right corner)
+    speaker_x = int(w * 0.70)  # Right 30% of width
+    speaker_h = int(h * 0.35)  # Top 35% of height
+
+    # Sum of differences in speaker region vs total
+    speaker_region = diff[0:speaker_h, speaker_x:w]
+    total_diff = np.sum(diff)
+    speaker_diff = np.sum(speaker_region)
+
+    if total_diff == 0:
+        return False
+
+    speaker_ratio = speaker_diff / total_diff
+    return speaker_ratio > threshold
+
+
+def detect_animation_change(img1: np.ndarray, img2: np.ndarray,
+                           pixel_threshold: float = 0.008,
+                           intensity_threshold: int = 30) -> bool:
+    """
+    Detect subtle animation changes that pHash might miss.
+
+    This uses pixel-level change detection to catch animation steps
+    that add/remove content but don't significantly change the overall
+    perceptual hash.
+
+    Args:
+        img1, img2: Images to compare
+        pixel_threshold: Fraction of pixels that must change significantly (default 0.8%)
+        intensity_threshold: Minimum pixel intensity difference to count as "changed"
+
+    Returns:
+        True if significant animation change detected
+    """
+    if img1.shape != img2.shape:
+        return False
+
+    h, w = img1.shape[:2]
+
+    # Convert to grayscale if needed
+    if len(img1.shape) == 3:
+        gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    else:
+        gray1, gray2 = img1, img2
+
+    # Compute absolute difference
+    diff = cv2.absdiff(gray1, gray2)
+
+    # Count significant pixel changes (excluding speaker region)
+    # Mask out speaker region for this calculation
+    speaker_x = int(w * 0.70)
+    speaker_h = int(h * 0.35)
+
+    # Create mask: 1 for content area, 0 for speaker region
+    mask = np.ones_like(diff, dtype=np.uint8)
+    mask[0:speaker_h, speaker_x:w] = 0
+
+    # Count significant changes in content area only
+    content_pixels = np.sum(mask)
+    significant_changes = np.sum((diff > intensity_threshold) & (mask == 1))
+
+    if content_pixels == 0:
+        return False
+
+    change_ratio = significant_changes / content_pixels
+    return change_ratio > pixel_threshold
 
 
 def phash_distance(hash1: np.ndarray, hash2: np.ndarray) -> float:
@@ -360,7 +472,7 @@ def find_slide_region(cap: cv2.VideoCapture, num_samples: int = 50) -> SlideRegi
 
 def extract_slides_to_memory(
     video_path: str,
-    hash_threshold: float = 0.15,
+    hash_threshold: float = 0.10,  # Lowered from 0.15 to catch subtle animation changes
     sample_interval_sec: float = 2.0,
     min_slide_duration_sec: float = 3.0,
     transition_delay_ms: int = 1200,
@@ -376,12 +488,19 @@ def extract_slides_to_memory(
     2. For each frame:
        a. Crop to detected slide region
        b. Check if it looks like a slide (vs speaker-only view)
-       c. Compute perceptual hash
+       c. Compute perceptual hash (with speaker region masked)
        d. Compare with previous frame's hash
-       e. If hash distance > threshold, a slide change is detected
+       e. If hash distance > threshold AND change is not just in speaker region,
+          a slide change is detected
     3. After detecting change, wait for transition to complete (1200ms)
     4. Verify stability by checking 3+ consecutive frames are similar
     5. Skip duplicate slides that appeared earlier
+
+    Speaker Overlay Handling:
+    - The top-right corner (where Zoom shows speaker video) is masked when
+      computing hashes, so speaker appearance/changes don't trigger false positives
+    - Additional check: if >70% of the pixel change is in the speaker region,
+      the change is ignored
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -402,8 +521,9 @@ def extract_slides_to_memory(
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     slides = []
-    slide_hashes = []
-    last_hash = None
+    slide_hashes = []  # Hashes without speaker masking (for duplicate check)
+    last_hash = None  # Hash with speaker masking (for change detection)
+    last_crop = None  # Keep previous crop for speaker region change check
     last_slide_frame = -min_slide_frames
     frame_num = 0
 
@@ -426,21 +546,42 @@ def extract_slides_to_memory(
 
         if not is_slide_visible(frame, slide_region):
             frame_num += 1
+            last_crop = slide_crop.copy()  # Still track for next comparison
             continue
 
-        current_hash = compute_phash(slide_crop)
+        # Compute hash with speaker region masked for change detection
+        current_hash = compute_phash(slide_crop, mask_speaker=True)
 
         is_new = False
+        detected_via_animation = False  # Track detection method for duplicate handling
         if last_hash is None:
             is_new = True
         else:
             distance = phash_distance(current_hash, last_hash)
+
+            # Primary detection: pHash threshold
             if distance > hash_threshold:
-                is_new = True
+                # Additional check: is this change primarily in the speaker region?
+                if last_crop is not None and is_change_in_speaker_region(last_crop, slide_crop, threshold=0.6):
+                    # Most of the change is in speaker region - likely speaker overlay, not slide change
+                    is_new = False
+                else:
+                    is_new = True
+
+            # Secondary detection: pixel-based animation detection
+            # This catches subtle animation changes that pHash misses
+            elif last_crop is not None and detect_animation_change(last_crop, slide_crop):
+                # Animation detected - verify it's not just speaker overlay
+                if not is_change_in_speaker_region(last_crop, slide_crop, threshold=0.6):
+                    is_new = True
+                    detected_via_animation = True  # Mark as animation-detected
 
         if is_new and frame_num - last_slide_frame >= min_slide_frames:
             # Check not duplicate of earlier slide
-            is_duplicate = any(phash_distance(current_hash, h) < hash_threshold for h in slide_hashes)
+            # For animation-detected slides, use stricter duplicate threshold (0.05)
+            # since pHash distance between animation steps can be very low
+            dup_threshold = 0.05 if detected_via_animation else hash_threshold
+            is_duplicate = any(phash_distance(current_hash, h) < dup_threshold for h in slide_hashes)
 
             if not is_duplicate:
                 capture_frame_num = frame_num + transition_delay_frames
@@ -453,7 +594,7 @@ def extract_slides_to_memory(
                     # Require 3 consecutive similar frames to confirm stability
                     stable_crop = None
                     stability_count = 0
-                    prev_hash = None
+                    prev_stability_hash = None
                     required_stable_frames = 3
 
                     for _ in range(20):  # Check more frames
@@ -465,10 +606,11 @@ def extract_slides_to_memory(
                         if crop_check.size == 0:
                             continue
 
-                        current_check_hash = compute_phash(crop_check)
+                        # Use masked hash for stability check too
+                        current_check_hash = compute_phash(crop_check, mask_speaker=True)
 
-                        if prev_hash is not None:
-                            stability_dist = phash_distance(current_check_hash, prev_hash)
+                        if prev_stability_hash is not None:
+                            stability_dist = phash_distance(current_check_hash, prev_stability_hash)
                             if stability_dist < 0.03:  # Stricter threshold
                                 stability_count += 1
                                 if stability_count >= required_stable_frames:
@@ -478,12 +620,12 @@ def extract_slides_to_memory(
                             else:
                                 stability_count = 0  # Reset if not stable
 
-                        prev_hash = current_check_hash
+                        prev_stability_hash = current_check_hash
                         # Skip a few frames between checks
                         for _ in range(3):
                             cap.read()
 
-                    if stable_crop is None and prev_hash is not None:
+                    if stable_crop is None and prev_stability_hash is not None:
                         stable_crop = crop_check
 
                     if stable_crop is not None and stable_crop.size > 0:
@@ -503,7 +645,8 @@ def extract_slides_to_memory(
                                 'index': len(slides) + 1
                             })
 
-                            slide_hashes.append(compute_phash(stable_crop))
+                            # Store masked hash for duplicate detection
+                            slide_hashes.append(compute_phash(stable_crop, mask_speaker=True))
                             last_slide_frame = frame_num
 
                             if progress_callback:
@@ -512,6 +655,7 @@ def extract_slides_to_memory(
                     cap.set(cv2.CAP_PROP_POS_FRAMES, int(current_pos))
 
         last_hash = current_hash
+        last_crop = slide_crop.copy()  # Track for speaker region change detection
         frame_num += 1
 
         # Progress update
