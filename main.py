@@ -577,13 +577,43 @@ def extract_slides_to_memory(
                     detected_via_animation = True  # Mark as animation-detected
 
         if is_new and frame_num - last_slide_frame >= min_slide_frames:
-            # Check not duplicate of earlier slide
-            # For animation-detected slides, use stricter duplicate threshold (0.05)
-            # since pHash distance between animation steps can be very low
-            dup_threshold = 0.05 if detected_via_animation else hash_threshold
-            is_duplicate = any(phash_distance(current_hash, h) < dup_threshold for h in slide_hashes)
+            # Check for near-identical slides anywhere in the presentation
+            # If found, we'll REPLACE the earlier one with this later version
+            # (later versions are more likely to be complete after animations)
+            IDENTICAL_THRESHOLD = 0.05  # Very strict - nearly pixel-perfect match
+            replace_index = None  # Index of slide to replace (if any)
 
-            if not is_duplicate:
+            # Check ALL previous slides for near-identical match
+            for i, prev_hash in enumerate(slide_hashes):
+                dist = phash_distance(current_hash, prev_hash)
+                if dist < IDENTICAL_THRESHOLD:
+                    # Found near-identical slide - mark for replacement
+                    replace_index = i
+                    break  # Replace earliest match
+
+            # Now check for regular duplicates (for skipping, not replacing)
+            is_duplicate = False
+            if replace_index is None:  # Only check if not replacing
+                # For animation-detected slides, skip duplicate checking entirely
+                # since we've already confirmed meaningful visual change via pixel analysis
+                if detected_via_animation:
+                    is_duplicate = False  # Trust pixel-based detection
+                else:
+                    # For rapid consecutive changes (within 30 seconds of last slide),
+                    # also skip duplicate checking - these are likely animation build-ups
+                    # where the same base slide is being built up incrementally
+                    time_since_last = (frame_num - last_slide_frame) / fps if fps > 0 else 0
+                    if time_since_last < 30 and len(slide_hashes) > 0:
+                        # Rapid change - only check against the immediately previous slide
+                        # to avoid false matches with earlier slides that might look similar
+                        is_duplicate = phash_distance(current_hash, slide_hashes[-1]) < hash_threshold
+                    else:
+                        # Only check against last 5 slides to avoid false duplicate matches
+                        # with unrelated slides from earlier in the presentation
+                        recent_hashes = slide_hashes[-5:] if len(slide_hashes) > 5 else slide_hashes
+                        is_duplicate = any(phash_distance(current_hash, h) < hash_threshold for h in recent_hashes)
+
+            if replace_index is not None or not is_duplicate:
                 capture_frame_num = frame_num + transition_delay_frames
 
                 if capture_frame_num < total_frames - 10:
@@ -638,19 +668,35 @@ def extract_slides_to_memory(
                             minutes = int(timestamp_sec // 60)
                             seconds = int(timestamp_sec % 60)
 
-                            slides.append({
-                                'image_data': img_bytes,
-                                'timestamp_sec': timestamp_sec,
-                                'timestamp_str': f"{minutes:02d}:{seconds:02d}",
-                                'index': len(slides) + 1
-                            })
+                            new_hash = compute_phash(stable_crop, mask_speaker=True)
 
-                            # Store masked hash for duplicate detection
-                            slide_hashes.append(compute_phash(stable_crop, mask_speaker=True))
+                            if replace_index is not None:
+                                # Replace the earlier slide with this later (more complete) version
+                                old_ts = slides[replace_index]['timestamp_str']
+                                slides[replace_index] = {
+                                    'image_data': img_bytes,
+                                    'timestamp_sec': timestamp_sec,
+                                    'timestamp_str': f"{minutes:02d}:{seconds:02d}",
+                                    'index': slides[replace_index]['index']  # Keep original index
+                                }
+                                slide_hashes[replace_index] = new_hash
+
+                                if progress_callback:
+                                    progress_callback(f"  Replaced slide {slides[replace_index]['index']} ({old_ts} -> {minutes:02d}:{seconds:02d})")
+                            else:
+                                # Add as new slide
+                                slides.append({
+                                    'image_data': img_bytes,
+                                    'timestamp_sec': timestamp_sec,
+                                    'timestamp_str': f"{minutes:02d}:{seconds:02d}",
+                                    'index': len(slides) + 1
+                                })
+                                slide_hashes.append(new_hash)
+
+                                if progress_callback:
+                                    progress_callback(f"  Found slide {len(slides)} at {minutes:02d}:{seconds:02d}")
+
                             last_slide_frame = frame_num
-
-                            if progress_callback:
-                                progress_callback(f"  Found slide {len(slides)} at {minutes:02d}:{seconds:02d}")
 
                     cap.set(cv2.CAP_PROP_POS_FRAMES, int(current_pos))
 

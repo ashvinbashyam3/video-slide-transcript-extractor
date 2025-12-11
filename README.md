@@ -188,18 +188,19 @@ def is_slide_visible(frame, region):
 
 **Problem**: Identify when one slide transitions to another.
 
-**Solution**: Perceptual hashing with temporal analysis.
+**Solution**: Multi-layer detection combining perceptual hashing, pixel analysis, and speaker overlay filtering.
 
 #### Perceptual Hash Algorithm (pHash)
 
 ```python
-def compute_phash(image, hash_size=16):
-    # 1. Resize to 16x16
-    # 2. Convert to grayscale
-    # 3. Apply DCT (Discrete Cosine Transform)
-    # 4. Keep top-left 8x8 (low frequencies)
-    # 5. Compute median
-    # 6. Create binary hash (above/below median)
+def compute_phash(image, hash_size=16, mask_speaker=False):
+    # 1. Optionally mask speaker overlay region (top-right corner)
+    # 2. Resize to 16x16
+    # 3. Convert to grayscale
+    # 4. Apply DCT (Discrete Cosine Transform)
+    # 5. Keep top-left 8x8 (low frequencies)
+    # 6. Compute median
+    # 7. Create binary hash (above/below median)
 ```
 
 **Why DCT-based pHash?**
@@ -208,21 +209,77 @@ def compute_phash(image, hash_size=16):
 - Fast to compute
 - Produces fixed-size hash (64 bits)
 
+#### Speaker Overlay Masking
+
+In Zoom and similar video recordings, a speaker video thumbnail often appears in the corner of the slide. This can cause false positive slide changes when the speaker moves or the overlay appears/disappears.
+
+**Solution**: Mask the top-right corner (25% width x 30% height) when computing hashes for change detection.
+
+```python
+# When mask_speaker=True:
+# Fill top-right corner with mid-gray (128, 128, 128)
+# This neutralizes the speaker region before hashing
+```
+
+Additionally, when a change is detected, we verify it's not primarily in the speaker region:
+- Compare pixel differences between frames
+- If >60% of the change is in the speaker region, ignore the change
+
+#### Animation Detection (Secondary Detection)
+
+pHash can miss subtle animation changes where content is progressively added to a slide (e.g., bullet points appearing one at a time). These animations don't change the overall slide structure enough to trigger the hash threshold.
+
+**Solution**: Pixel-level change detection as secondary check.
+
+```python
+def detect_animation_change(img1, img2, pixel_threshold=0.008, intensity_threshold=30):
+    # 1. Compute absolute pixel difference (grayscale)
+    # 2. Mask out speaker region
+    # 3. Count pixels with difference > intensity_threshold
+    # 4. If changed pixels > pixel_threshold (0.8%), animation detected
+```
+
+This catches subtle changes that pHash misses while avoiding false positives from speaker overlay changes.
+
 #### Change Detection Parameters
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `hash_threshold` | 0.15 | Hamming distance threshold for change detection |
+| `hash_threshold` | 0.10 | Hamming distance threshold for change detection (lowered from 0.15 to catch subtle animations) |
 | `sample_interval` | 2.0s | How often to check for changes |
 | `min_slide_duration` | 3.0s | Minimum time between slides |
-| `transition_delay` | 500ms | Wait after change for transition to complete |
+| `transition_delay` | 1200ms | Wait after change for transition to complete (increased for stability) |
 
-#### Duplicate Slide Filtering
+#### Duplicate Handling: "Replace Earlier with Later"
 
-To avoid capturing the same slide multiple times (e.g., returning to a previous slide):
-- Maintain list of all captured slide hashes
-- Before saving new slide, check against all previous slides
-- Skip if Hamming distance < threshold to any previous slide
+**Problem**: Presentations often return to the same slide or show animation steps. The naive approach of "skip duplicates" has a flaw: the first occurrence of a slide may be incomplete (e.g., before animations finish), while later occurrences may show the complete slide.
+
+**Solution**: "Replace earlier with later" strategy.
+
+```python
+IDENTICAL_THRESHOLD = 0.05  # Very strict - nearly pixel-perfect match
+
+# When a new slide is detected:
+# 1. Check ALL previous slides for near-identical match
+# 2. If found, REPLACE the earlier slide with this later version
+# 3. Keep the original slide index (for consistent ordering)
+# 4. This ensures we capture the most complete version of each slide
+```
+
+**Example**:
+- Slide appears at 23:53 (with partial animation)
+- Same slide reappears at 23:59 (animation complete)
+- Result: Slide 16 shows 23:59 version (replaced)
+
+This is logged as: `Replaced slide 16 (23:53 -> 23:59)`
+
+#### Rapid Change Handling
+
+For slides that appear in quick succession (within 30 seconds), we use special handling:
+- Animation-detected slides skip duplicate checking entirely (we trust the pixel-based detection)
+- Rapid consecutive changes only check against the immediately previous slide, not all historical slides
+
+This prevents false duplicate matches with unrelated slides from earlier in the presentation that happen to look similar.
 
 ### Stage 4: Transition Handling
 
@@ -383,6 +440,40 @@ video.close()
 - Require actual white/light background (not just uniform color)
 - Check edge density range (too many edges = face, too few = blank)
 - Skin tone filtering
+
+### 7. Speaker Overlay Causing False Positives
+
+**Problem**: When the speaker video overlay appears/disappears or the speaker moves, it changes the hash enough to trigger false slide changes.
+
+**Solution**: Multi-layer speaker filtering:
+1. **Hash Masking**: Mask top-right corner (25% x 30%) when computing hashes
+2. **Change Localization**: After detecting a change, compute pixel differences and check if >60% is in speaker region
+3. If the change is primarily in the speaker region, ignore it
+
+### 8. Animation Steps Being Missed
+
+**Problem**: pHash-based detection misses subtle animation changes (e.g., bullet points appearing) because the overall image structure doesn't change significantly.
+
+**Solution**: Dual detection system:
+1. **Primary**: pHash distance threshold (0.10)
+2. **Secondary**: Pixel-level change detection for animations
+   - Count pixels with intensity difference > 30
+   - If >0.8% of content pixels changed, detect as animation
+   - Mask speaker region in this calculation too
+
+### 9. Duplicate Slides Capturing Wrong Version
+
+**Problem**: When a slide appears multiple times (e.g., due to animation or returning to previous slide), the "skip duplicates" approach kept the FIRST occurrence, which might be incomplete (before animations finished).
+
+**Solution**: "Replace earlier with later" strategy:
+- When detecting a near-identical slide (hash distance < 0.05), REPLACE the earlier version
+- Keep the original slide index for consistent ordering
+- This ensures the most complete version is captured
+
+**Tradeoffs**:
+- Slightly more computation (check all previous slides)
+- Assumes later = more complete (generally true for animations)
+- Very strict threshold (0.05) prevents false replacements
 
 ## File Structure
 
