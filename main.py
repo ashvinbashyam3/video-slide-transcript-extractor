@@ -996,18 +996,41 @@ def main():
 
     start_time = time.time()
 
-    # Step 1: Extract slides
-    print("\n[1/4] Extracting slides from video...")
-    slides = extract_slides_to_memory(str(video_path), progress_callback=print_progress)
-    print(f"  Found {len(slides)} slides")
+    # Steps 1 & 2: Extract slides AND generate transcript IN PARALLEL
+    # These are independent operations that can run simultaneously:
+    # - Slide extraction: CPU-bound (OpenCV frame processing)
+    # - Transcript generation: IO-bound (audio upload to Gemini API)
+    print("\n[1/4] Extracting slides and generating transcript (in parallel)...")
 
-    # Step 2: Generate transcript
-    print("\n[2/4] Generating transcript...")
-    transcript = generate_transcript_gemini(str(video_path), api_key, progress_callback=print_progress)
-    print(f"  Generated {len(transcript)} transcript entries")
+    slides = []
+    transcript = []
 
-    # Step 3: Clean up transcript and consolidate
-    print("\n[3/4] Cleaning up transcript...")
+    def extract_slides_task():
+        """Wrapper for slide extraction with prefixed progress."""
+        def progress(msg):
+            print(f"  [Slides] {msg}")
+        return extract_slides_to_memory(str(video_path), progress_callback=progress)
+
+    def generate_transcript_task():
+        """Wrapper for transcript generation with prefixed progress."""
+        def progress(msg):
+            print(f"  [Transcript] {msg}")
+        return generate_transcript_gemini(str(video_path), api_key, progress_callback=progress)
+
+    # Run both tasks in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slides_future = executor.submit(extract_slides_task)
+        transcript_future = executor.submit(generate_transcript_task)
+
+        # Wait for both to complete
+        slides = slides_future.result()
+        transcript = transcript_future.result()
+
+    print(f"  [Slides] Found {len(slides)} slides")
+    print(f"  [Transcript] Generated {len(transcript)} entries")
+
+    # Step 2: Clean up transcript and consolidate
+    print("\n[2/4] Cleaning up transcript...")
     transcript = cleanup_transcript_entries(transcript, api_key, progress_callback=print_progress)
 
     # Consolidate consecutive entries from the same speaker
@@ -1015,12 +1038,12 @@ def main():
     transcript = consolidate_speaker_entries(transcript)
     print(f"  Consolidated {original_count} entries -> {len(transcript)} paragraphs")
 
-    # Step 4: Generate slide captions
-    print("\n[4/4] Generating slide captions...")
+    # Step 3: Generate slide captions
+    print("\n[3/4] Generating slide captions...")
     slides = generate_slide_captions(slides, api_key, progress_callback=print_progress)
 
-    # Generate HTML
-    print("\nGenerating HTML document...")
+    # Step 4: Generate HTML
+    print("\n[4/4] Generating HTML document...")
     title = video_path.stem.replace('_', ' ').replace('-', ' ')
     html_content = generate_html(transcript, slides, title=title)
 

@@ -93,23 +93,36 @@ Example output filename: `video_name.html` (same location as input video)
 
 ## Architecture Overview
 
-The program consists of four main processing stages:
+The program consists of four main processing stages, with parallelization for speed:
 
 ```
 Video File
     │
-    ├─► [1] Slide Extraction (OpenCV)
-    │       └─► Slides in memory (JPEG bytes)
+    ├─► [1a] Slide Extraction (OpenCV)     ─┐
+    │        └─► Slides in memory           │  PARALLEL
+    │                                       │  (runs simultaneously)
+    ├─► [1b] Audio → Transcription ────────┘
+    │        └─► Transcript entries
     │
-    ├─► [2] Audio Extraction (moviepy)
-    │       └─► Audio chunks (MP3)
+    ├─► [2] Transcript Cleanup (Gemini API)
+    │        └─► Speaker names, error fixes
     │
-    ├─► [3] Transcription (Gemini API)
-    │       └─► Transcript entries
+    ├─► [3] Slide Captioning (Gemini Vision) ── PARALLEL (5 concurrent)
+    │        └─► Slide descriptions
     │
     └─► [4] HTML Generation
-            └─► Single HTML file with embedded slides
+             └─► Single HTML file with embedded slides
 ```
+
+## Performance Optimizations
+
+The program uses several parallelization strategies:
+
+1. **Parallel Slide + Transcript Processing**: Steps 1a and 1b run concurrently using `ThreadPoolExecutor`. Since slide extraction is CPU-bound (OpenCV) and transcript generation is IO-bound (API calls), they don't compete for resources.
+
+2. **Parallel Slide Captioning**: All slides are captioned concurrently (5 workers) rather than sequentially, reducing this step from O(n) to O(n/5) time.
+
+3. **Chunked Audio Processing**: Long videos are split into 20-minute audio chunks, which are processed sequentially but efficiently uploaded to the Gemini API.
 
 ## Slide Detection Methodology
 
