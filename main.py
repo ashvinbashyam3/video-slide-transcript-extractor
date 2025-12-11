@@ -17,7 +17,6 @@ Output:
 
 import argparse
 import base64
-import io
 import os
 import sys
 import tempfile
@@ -25,8 +24,7 @@ import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
-import tkinter as tk
-from tkinter import filedialog
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Third-party imports
 try:
@@ -159,15 +157,96 @@ def is_slide_visible(frame: np.ndarray, region: SlideRegion) -> bool:
     return has_slide_background and has_low_skin and has_content
 
 
-def find_slide_region(cap: cv2.VideoCapture, num_samples: int = 30) -> SlideRegion:
+def detect_slide_boundaries_single_frame(frame: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     """
-    Analyze video frames to detect the slide region.
+    Detect slide boundaries in a single frame using edge and color analysis.
+    Returns (left, top, right, bottom) or None if no clear slide detected.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    height, width = gray.shape
 
-    Strategy:
-    1. Sample frames throughout the video
-    2. Find frames that look like they contain slides (white content)
-    3. Analyze edge profiles to find slide boundaries
-    4. Snap to standard aspect ratio (16:9, 16:10, or 4:3)
+    # Compute horizontal gradient (finds vertical edges)
+    grad_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+    grad_x = np.abs(grad_x)
+
+    # Compute vertical gradient (finds horizontal edges)
+    grad_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+    grad_y = np.abs(grad_y)
+
+    # Sum gradients along axes to find edge positions
+    vertical_edge_strength = np.sum(grad_x, axis=0)
+    horizontal_edge_strength = np.sum(grad_y, axis=1)
+
+    # Normalize
+    vertical_edge_strength = vertical_edge_strength / np.max(vertical_edge_strength) if np.max(vertical_edge_strength) > 0 else vertical_edge_strength
+    horizontal_edge_strength = horizontal_edge_strength / np.max(horizontal_edge_strength) if np.max(horizontal_edge_strength) > 0 else horizontal_edge_strength
+
+    # Also use brightness analysis - slides are typically brighter
+    col_brightness = np.mean(gray, axis=0)
+    row_brightness = np.mean(gray, axis=1)
+
+    # Find RIGHT edge: look for where brightness drops significantly AND edge strength is high
+    right_edge = int(width * 0.75)  # default
+    search_start = int(width * 0.55)
+    search_end = int(width * 0.92)
+
+    # Smooth the brightness profile
+    col_brightness_smooth = np.convolve(col_brightness, np.ones(15)/15, mode='same')
+
+    for x in range(search_end, search_start, -1):
+        # Check for brightness drop
+        left_region = col_brightness_smooth[max(0, x-50):x]
+        right_region = col_brightness_smooth[x:min(width, x+50)]
+        if len(left_region) > 0 and len(right_region) > 0:
+            left_mean = np.mean(left_region)
+            right_mean = np.mean(right_region)
+            # Significant brightness change indicates edge
+            if left_mean > 150 and right_mean < left_mean * 0.85:
+                right_edge = x
+                break
+
+    # Find LEFT edge (usually 0, but check for black bars)
+    left_edge = 0
+    for x in range(int(width * 0.15)):
+        if col_brightness_smooth[x] > 100:
+            left_edge = max(0, x - 2)
+            break
+
+    # Find TOP edge
+    row_brightness_smooth = np.convolve(row_brightness, np.ones(10)/10, mode='same')
+    top_edge = 0
+    for y in range(int(height * 0.25)):
+        if row_brightness_smooth[y] > 120:
+            top_edge = max(0, y - 2)
+            break
+
+    # Find BOTTOM edge
+    bottom_edge = height
+    for y in range(height - 1, int(height * 0.75), -1):
+        if row_brightness_smooth[y] > 120:
+            bottom_edge = min(height, y + 2)
+            break
+
+    # Validate: the detected region should have significant white content
+    if right_edge > left_edge and bottom_edge > top_edge:
+        region = gray[top_edge:bottom_edge, left_edge:right_edge]
+        white_ratio = np.sum(region > 200) / region.size if region.size > 0 else 0
+        if white_ratio > 0.15:
+            return (left_edge, top_edge, right_edge, bottom_edge)
+
+    return None
+
+
+def find_slide_region(cap: cv2.VideoCapture, num_samples: int = 50) -> SlideRegion:
+    """
+    Robust slide region detection using multi-frame consensus.
+
+    Algorithm:
+    1. Sample many frames throughout the video
+    2. Filter to frames that likely contain slides (high white content, low skin)
+    3. For each qualifying frame, detect slide boundaries using edge/brightness analysis
+    4. Use median of detected boundaries for robustness (handles varying layouts)
+    5. Snap final region to standard aspect ratio
     """
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -175,62 +254,71 @@ def find_slide_region(cap: cv2.VideoCapture, num_samples: int = 30) -> SlideRegi
 
     ASPECT_RATIOS = {"16:9": 16/9, "16:10": 16/10, "4:3": 4/3}
 
-    # Sample frames
-    sample_positions = np.linspace(total_frames * 0.15, total_frames * 0.85, num_samples, dtype=int)
+    # Sample positions (avoid first/last 10%)
+    sample_positions = np.linspace(total_frames * 0.10, total_frames * 0.90, num_samples, dtype=int)
 
-    slide_frames = []
+    detected_boundaries = []
+
     for pos in sample_positions:
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
         ret, frame = cap.read()
-        if ret:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            white_ratio = np.sum(gray > 200) / gray.size
-            if white_ratio > 0.2:
-                slide_frames.append(frame)
+        if not ret:
+            continue
 
-    if not slide_frames:
-        # Fallback: assume 16:9 slide taking 70% of width
-        slide_width = int(width * 0.70)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # Quick check: does this frame likely have a slide?
+        white_ratio = np.sum(gray > 200) / gray.size
+        if white_ratio < 0.12:
+            continue  # Probably no slide visible
+
+        # Check for low skin tone (not just speaker view)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        skin_mask = (
+            (hsv[:, :, 0] >= 0) & (hsv[:, :, 0] <= 25) &
+            (hsv[:, :, 1] >= 40) & (hsv[:, :, 1] <= 180) &
+            (hsv[:, :, 2] >= 80)
+        )
+        skin_ratio = np.sum(skin_mask) / skin_mask.size
+        if skin_ratio > 0.15:
+            continue  # Too much skin - probably speaker-only view
+
+        # Detect boundaries for this frame
+        boundaries = detect_slide_boundaries_single_frame(frame)
+        if boundaries is not None:
+            detected_boundaries.append(boundaries)
+
+    # Need at least 5 valid detections for consensus
+    if len(detected_boundaries) < 5:
+        # Fallback to simple detection
+        slide_width = int(width * 0.72)
         slide_height = int(slide_width / ASPECT_RATIOS["16:9"])
         margin_y = (height - slide_height) // 2
         return SlideRegion(0, margin_y, slide_width, slide_height)
 
-    ref_frame = slide_frames[len(slide_frames) // 2]
-    gray = cv2.cvtColor(ref_frame, cv2.COLOR_BGR2GRAY)
+    # Use median of detected boundaries for robustness
+    lefts = [b[0] for b in detected_boundaries]
+    tops = [b[1] for b in detected_boundaries]
+    rights = [b[2] for b in detected_boundaries]
+    bottoms = [b[3] for b in detected_boundaries]
 
-    # Find right edge of slide (where speaker thumbnail begins)
-    top_section = gray[:height // 3, :]
-    white_in_top = np.sum(top_section > 200, axis=0)
-    white_ratio_by_col = white_in_top / (height // 3)
+    left = int(np.median(lefts))
+    top = int(np.median(tops))
+    right = int(np.median(rights))
+    bottom = int(np.median(bottoms))
 
-    search_start = int(width * 0.60)
-    search_end = int(width * 0.90)
+    detected_width = right - left
+    detected_height = bottom - top
 
-    slide_right = int(width * 0.70)
-    for x in range(search_end, search_start, -1):
-        if white_ratio_by_col[x] > 0.3:
-            slide_right = x + 10
-            break
-
-    # Find top/bottom boundaries
-    row_mean = np.mean(gray[:, :slide_right], axis=1)
-
-    top_boundary = 0
-    for i in range(height // 6):
-        if row_mean[i] > 150:
-            top_boundary = max(0, i - 2)
-            break
-
-    bottom_boundary = height
-    for i in range(height - 1, 5 * height // 6, -1):
-        if row_mean[i] > 150:
-            bottom_boundary = min(height, i + 2)
-            break
+    if detected_width <= 0 or detected_height <= 0:
+        # Fallback
+        slide_width = int(width * 0.72)
+        slide_height = int(slide_width / ASPECT_RATIOS["16:9"])
+        margin_y = (height - slide_height) // 2
+        return SlideRegion(0, margin_y, slide_width, slide_height)
 
     # Snap to standard aspect ratio
-    detected_width = slide_right
-    detected_height = bottom_boundary - top_boundary
-    detected_ratio = detected_width / detected_height if detected_height > 0 else 1.5
+    detected_ratio = detected_width / detected_height
 
     best_ratio_name = "16:9"
     best_diff = float('inf')
@@ -241,19 +329,33 @@ def find_slide_region(cap: cv2.VideoCapture, num_samples: int = 30) -> SlideRegi
             best_ratio_name = name
     target_ratio = ASPECT_RATIOS[best_ratio_name]
 
-    final_width = slide_right
-    ideal_height = int(final_width / target_ratio)
+    # Adjust dimensions to match target ratio while staying within detected bounds
+    ideal_height = int(detected_width / target_ratio)
 
-    if ideal_height <= (bottom_boundary - top_boundary):
+    if ideal_height <= detected_height:
         final_height = ideal_height
-        vertical_margin = ((bottom_boundary - top_boundary) - final_height) // 2
-        final_top = top_boundary + vertical_margin
+        final_width = detected_width
+        # Center vertically within detected region
+        vertical_margin = (detected_height - final_height) // 2
+        final_top = top + vertical_margin
     else:
-        final_height = bottom_boundary - top_boundary
+        final_height = detected_height
         final_width = int(final_height * target_ratio)
-        final_top = top_boundary
+        final_top = top
 
-    return SlideRegion(0, final_top, min(final_width, width), min(final_height, height - final_top))
+    # Add small padding inward to ensure tight crop (remove any border artifacts)
+    padding = 3
+    final_left = left + padding
+    final_top = final_top + padding
+    final_width = max(100, final_width - 2 * padding)
+    final_height = max(100, final_height - 2 * padding)
+
+    return SlideRegion(
+        final_left,
+        final_top,
+        min(final_width, width - final_left),
+        min(final_height, height - final_top)
+    )
 
 
 def extract_slides_to_memory(
@@ -261,7 +363,7 @@ def extract_slides_to_memory(
     hash_threshold: float = 0.15,
     sample_interval_sec: float = 2.0,
     min_slide_duration_sec: float = 3.0,
-    transition_delay_ms: int = 500,
+    transition_delay_ms: int = 1200,
     progress_callback=None
 ) -> List[Dict]:
     """
@@ -277,8 +379,8 @@ def extract_slides_to_memory(
        c. Compute perceptual hash
        d. Compare with previous frame's hash
        e. If hash distance > threshold, a slide change is detected
-    3. After detecting change, wait for transition to complete (500ms)
-    4. Verify stability by checking consecutive frames are similar
+    3. After detecting change, wait for transition to complete (1200ms)
+    4. Verify stability by checking 3+ consecutive frames are similar
     5. Skip duplicate slides that appeared earlier
     """
     cap = cv2.VideoCapture(video_path)
@@ -348,10 +450,13 @@ def extract_slides_to_memory(
                     cap.set(cv2.CAP_PROP_POS_FRAMES, capture_frame_num)
 
                     # Find stable frame after transition
+                    # Require 3 consecutive similar frames to confirm stability
                     stable_crop = None
+                    stability_count = 0
                     prev_hash = None
+                    required_stable_frames = 3
 
-                    for _ in range(10):
+                    for _ in range(20):  # Check more frames
                         ret_check, frame_check = cap.read()
                         if not ret_check:
                             break
@@ -364,13 +469,18 @@ def extract_slides_to_memory(
 
                         if prev_hash is not None:
                             stability_dist = phash_distance(current_check_hash, prev_hash)
-                            if stability_dist < 0.05:
-                                stable_crop = crop_check
-                                capture_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                                break
+                            if stability_dist < 0.03:  # Stricter threshold
+                                stability_count += 1
+                                if stability_count >= required_stable_frames:
+                                    stable_crop = crop_check
+                                    capture_frame_num = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+                                    break
+                            else:
+                                stability_count = 0  # Reset if not stable
 
                         prev_hash = current_check_hash
-                        for _ in range(2):
+                        # Skip a few frames between checks
+                        for _ in range(3):
                             cap.read()
 
                     if stable_crop is None and prev_hash is not None:
@@ -538,6 +648,34 @@ Output the transcript:"""
     return all_entries
 
 
+def consolidate_speaker_entries(entries: List[Dict]) -> List[Dict]:
+    """
+    Consolidate consecutive entries from the same speaker into single entries.
+
+    Before: [{speaker: "John", text: "Hello"}, {speaker: "John", text: "How are you?"}]
+    After:  [{speaker: "John", text: "Hello How are you?"}]
+    """
+    if not entries:
+        return entries
+
+    consolidated = []
+    current = entries[0].copy()
+
+    for entry in entries[1:]:
+        if entry.get('speaker', '').upper() == current.get('speaker', '').upper():
+            # Same speaker - merge text
+            current['text'] = current.get('text', '') + ' ' + entry.get('text', '')
+        else:
+            # Different speaker - save current and start new
+            consolidated.append(current)
+            current = entry.copy()
+
+    # Don't forget the last entry
+    consolidated.append(current)
+
+    return consolidated
+
+
 def cleanup_transcript_entries(
     entries: List[Dict],
     api_key: str,
@@ -563,18 +701,27 @@ def cleanup_transcript_entries(
         chunk = entries[i:i + chunk_size]
         chunk_text = '\n'.join([f"{e['speaker']}: {e['text']}" for e in chunk])
 
-        prompt = f"""Clean up this transcript segment from a webinar/presentation.
+        prompt = f"""Clean up this transcript segment from a webinar or presentation recording.
 
-Instructions:
-1. Identify speakers by name if mentioned (replace SPEAKER_1, etc. with actual names)
-2. Fix transcription errors and technical terms
-3. Keep the format: SPEAKER_NAME: [text]
-4. Do not add or remove content
+IMPORTANT INSTRUCTIONS:
+1. SPEAKER IDENTIFICATION: Look carefully for when speakers introduce themselves or are introduced.
+   - Listen for phrases like "I'm [Name]", "My name is [Name]", "This is [Name]", "[Name] speaking"
+   - Replace SPEAKER_1, SPEAKER_2, etc. with actual first names when identified (e.g., "JOSH", "SARAH")
+   - Use UPPERCASE for speaker names
+   - If you cannot identify a speaker's name, keep the original SPEAKER_X label
+
+2. Fix obvious transcription errors, especially:
+   - Technical/medical/scientific terms
+   - Company and product names
+   - Proper nouns
+
+3. Keep the exact format: SPEAKER_NAME: [text]
+4. Do NOT add, remove, or rephrase content - only fix errors and identify speakers
 
 Transcript:
 {chunk_text}
 
-Return cleaned transcript:"""
+Return the cleaned transcript with identified speaker names:"""
 
         try:
             response = model.generate_content(
@@ -588,7 +735,7 @@ Return cleaned transcript:"""
                     if ':' in line:
                         parts = line.split(':', 1)
                         if len(parts) == 2:
-                            speaker = parts[0].strip()
+                            speaker = parts[0].strip().upper()
                             text = parts[1].strip()
                             if text and not speaker.startswith('['):
                                 cleaned_entries.append({'speaker': speaker, 'text': text})
@@ -606,20 +753,27 @@ Return cleaned transcript:"""
 def generate_slide_captions(
     slides: List[Dict],
     api_key: str,
-    progress_callback=None
+    progress_callback=None,
+    max_workers: int = 5
 ) -> List[Dict]:
-    """Generate captions for slides using Gemini Vision."""
+    """
+    Generate captions for slides using Gemini Vision in parallel.
+
+    Uses ThreadPoolExecutor to make concurrent API calls, significantly
+    speeding up the captioning process for multiple slides.
+    """
+    if not slides:
+        return slides
+
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-2.0-flash')
 
     if progress_callback:
-        progress_callback("Generating slide captions...")
+        progress_callback(f"Generating slide captions ({len(slides)} slides in parallel)...")
 
-    for i, slide in enumerate(slides):
-        if progress_callback:
-            progress_callback(f"  Captioning slide {i + 1}/{len(slides)}...")
-
+    def caption_single_slide(slide: Dict) -> Tuple[int, str]:
+        """Caption a single slide. Returns (index, caption)."""
         try:
+            model = genai.GenerativeModel('gemini-2.0-flash')
             prompt = "Describe this presentation slide in 2-3 sentences. Focus on the main topic and key data points."
 
             response = model.generate_content([
@@ -627,9 +781,30 @@ def generate_slide_captions(
                 prompt
             ])
 
-            slide['caption'] = response.text.strip()
+            return (slide['index'], response.text.strip())
         except Exception as e:
-            slide['caption'] = f"Slide {slide['index']}"
+            return (slide['index'], f"Slide {slide['index']}")
+
+    # Process slides in parallel
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(caption_single_slide, slide): slide for slide in slides}
+
+        for future in as_completed(futures):
+            try:
+                idx, caption = future.result()
+                # Find and update the slide
+                for slide in slides:
+                    if slide['index'] == idx:
+                        slide['caption'] = caption
+                        break
+                completed += 1
+                if progress_callback:
+                    progress_callback(f"  Captioned slide {completed}/{len(slides)}")
+            except Exception as e:
+                slide = futures[future]
+                slide['caption'] = f"Slide {slide['index']}"
+                completed += 1
 
     return slides
 
@@ -782,28 +957,6 @@ def generate_html(
 # MAIN PROGRAM
 # =============================================================================
 
-def select_video_file() -> Optional[str]:
-    """Open file dialog to select a video file."""
-    root = tk.Tk()
-    root.withdraw()  # Hide the root window
-
-    # Get Downloads folder path
-    downloads_path = str(Path.home() / "Downloads")
-
-    file_path = filedialog.askopenfilename(
-        title="Select Video File",
-        initialdir=downloads_path,
-        filetypes=[
-            ("Video files", "*.mp4 *.avi *.mov *.mkv *.webm"),
-            ("MP4 files", "*.mp4"),
-            ("All files", "*.*")
-        ]
-    )
-
-    root.destroy()
-    return file_path if file_path else None
-
-
 def print_progress(message: str):
     """Print progress message to console."""
     print(message)
@@ -815,8 +968,7 @@ def main():
     )
     parser.add_argument(
         "video",
-        nargs="?",
-        help="Path to video file (opens file dialog if not provided)"
+        help="Path to video file"
     )
     parser.add_argument(
         "--api-key", "-k",
@@ -833,15 +985,7 @@ def main():
         sys.exit(1)
 
     # Get video file
-    if args.video:
-        video_path = Path(args.video).resolve()
-    else:
-        print("Select a video file...")
-        selected = select_video_file()
-        if not selected:
-            print("No file selected. Exiting.")
-            sys.exit(0)
-        video_path = Path(selected).resolve()
+    video_path = Path(args.video).resolve()
 
     if not video_path.exists():
         print(f"Error: Video file not found: {video_path}")
@@ -862,9 +1006,14 @@ def main():
     transcript = generate_transcript_gemini(str(video_path), api_key, progress_callback=print_progress)
     print(f"  Generated {len(transcript)} transcript entries")
 
-    # Step 3: Clean up transcript
+    # Step 3: Clean up transcript and consolidate
     print("\n[3/4] Cleaning up transcript...")
     transcript = cleanup_transcript_entries(transcript, api_key, progress_callback=print_progress)
+
+    # Consolidate consecutive entries from the same speaker
+    original_count = len(transcript)
+    transcript = consolidate_speaker_entries(transcript)
+    print(f"  Consolidated {original_count} entries -> {len(transcript)} paragraphs")
 
     # Step 4: Generate slide captions
     print("\n[4/4] Generating slide captions...")
