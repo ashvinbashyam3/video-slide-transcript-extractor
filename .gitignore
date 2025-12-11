@@ -1,0 +1,53 @@
+# Environment variables and secrets
+.env
+.env.local
+*.env
+
+# API keys
+secrets.txt
+api_keys.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Video/Audio files (don't commit test files)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.mp3
+*.wav
+
+# Output files (generated)
+*.html
+
+# Test output folders
+*_output/
+slides_metadata.json
+*_transcript.txt
+*_transcript_cleaned.txt
