@@ -332,6 +332,47 @@ Transcribe this audio with speaker diarization.
 - One speaker turn per line
 ```
 
+### Pre/Post Meeting Fluff Trimming
+
+**Problem**: Recorded meetings often start with setup chatter and end with goodbyes that aren't part of the actual content.
+
+**Examples of fluff**:
+```
+OMAR: Omar, hi.
+SPEAKER_2: Oh.
+OMAR: We're good.
+SPEAKER_2: Okay, I think we just hit start.
+SPEAKER_3: Excellent.
+SPEAKER_5: Yes, my integrated camera, the video won't start, but I am here.
+SPEAKER_2: Okay, fantastic, outstanding.
+```
+
+**Solution**: `trim_transcript_fluff()` uses Gemini to identify where content actually starts/ends.
+
+**Start Detection** - Content begins at:
+- Formal introductions ("I'm [Name] from [Company]")
+- Topic/agenda introduction ("Today we'll be discussing...")
+- Formal welcome ("Welcome everyone to...")
+
+**Start Fluff Patterns**:
+- Technical setup ("Can you hear me?", "Let me share my screen")
+- Casual greetings ("Hi", "Hello", "Hey everyone", "We're good")
+- Recording notices ("I think we just hit start")
+- Short acknowledgments ("Okay", "Sure", "Yes", "Oh", "Got it")
+
+**End Detection** - Content ends before:
+- Generic thank-yous and farewells
+- Meeting wrap-up logistics ("I'll send the recording")
+- Casual goodbyes ("Talk to you later", "Take care")
+
+**Implementation**:
+```python
+# Analyzes first/last 25 entries
+# Returns trimmed entry indices
+# Prompts ask Gemini to return single number (index)
+trimmed = trim_transcript_fluff(entries, api_key, max_entries_to_check=25)
+```
+
 ### Transcript Cleanup
 
 **Process**:

@@ -838,6 +838,152 @@ Output the transcript:"""
     return all_entries
 
 
+def trim_transcript_fluff(
+    entries: List[Dict],
+    api_key: str,
+    max_entries_to_check: int = 25,
+    progress_callback=None
+) -> List[Dict]:
+    """
+    Remove pre-meeting setup chatter and post-meeting farewells from transcript.
+
+    This function uses Gemini to identify filler content at the beginning and end
+    of transcripts, such as:
+    - Technical setup ("Can you hear me?", "My camera won't start")
+    - Greetings before content starts ("Hi everyone", "We're good to go")
+    - Casual chat before presentation ("How was your weekend?")
+    - Post-meeting wrap-up ("Thanks everyone", "Talk to you later")
+
+    Args:
+        entries: List of transcript entries [{speaker, text}]
+        api_key: Gemini API key
+        max_entries_to_check: How many entries to check at start/end (default 25)
+        progress_callback: Optional progress callback function
+
+    Returns:
+        Trimmed list of entries with fluff removed
+    """
+    if not entries or len(entries) < 5:
+        return entries
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel('gemini-2.0-flash')
+
+    if progress_callback:
+        progress_callback("Trimming pre/post meeting fluff from transcript...")
+
+    # Check beginning of transcript
+    start_entries = entries[:max_entries_to_check]
+    start_text = '\n'.join([f"{i}: {e['speaker']}: {e['text']}" for i, e in enumerate(start_entries)])
+
+    start_prompt = f"""Analyze this transcript from the BEGINNING of a recorded meeting/webinar.
+Identify where the actual content starts (vs pre-meeting setup chatter).
+
+Pre-meeting filler includes:
+- Technical setup ("Can you hear me?", "Let me share my screen", "Is my video working?")
+- Casual greetings before content ("Hi", "Hello", "Hey everyone", "We're good")
+- Waiting for people ("Just waiting for a few more", "I think we hit start")
+- Small talk ("How are you?", "How was your weekend?")
+- Recording notices ("I think we just hit start", "Recording has started")
+- Acknowledgments with no content ("Okay", "Sure", "Yes", "Oh", "Got it")
+- Meeting logistics ("Let's wait a minute", "Can everyone see the slides?")
+
+Actual content starts when:
+- A presenter introduces themselves formally ("I'm [Name] from [Company]")
+- The topic/agenda is introduced ("Today we'll be discussing...")
+- Substantive information is presented (not just greetings or logistics)
+- A formal welcome to the audience ("Welcome everyone to...")
+
+IMPORTANT: Be aggressive about removing fluff. Short acknowledgments like "Okay", "Sure", "Yes"
+before the actual content starts should be removed.
+
+Return ONLY a single number: the index (0-based) of the FIRST entry that is actual content.
+If the content starts from the very beginning, return 0.
+
+Transcript (numbered by index):
+{start_text}
+
+Return only the number (e.g., "5" or "12"):"""
+
+    start_idx = 0
+    try:
+        response = model.generate_content(
+            start_prompt,
+            generation_config=genai.GenerationConfig(temperature=0.1, max_output_tokens=10)
+        )
+        if response.text:
+            # Parse the number from response
+            num_str = ''.join(c for c in response.text.strip() if c.isdigit())
+            if num_str:
+                start_idx = min(int(num_str), len(entries) - 1)
+    except Exception as e:
+        if progress_callback:
+            progress_callback(f"  Warning: Could not trim start ({e})")
+        start_idx = 0
+
+    # Check end of transcript
+    end_entries = entries[-max_entries_to_check:]
+    # Calculate actual indices for end entries
+    end_offset = len(entries) - len(end_entries)
+    end_text = '\n'.join([f"{end_offset + i}: {e['speaker']}: {e['text']}" for i, e in enumerate(end_entries)])
+
+    end_prompt = f"""Analyze this transcript from the END of a recorded meeting/webinar.
+Identify where the actual content ends (vs post-meeting wrap-up).
+
+Post-meeting filler includes:
+- Thank-yous and farewells ("Thanks everyone", "Thank you for joining", "Bye")
+- Meeting wrap-up logistics ("I'll send the recording", "Let me stop the recording")
+- Casual goodbyes ("Talk to you later", "Have a good day", "Take care")
+- Generic acknowledgments ("Okay", "Sure", "Sounds good")
+- Questions about next steps unrelated to content ("When's the next meeting?")
+
+Actual content includes:
+- Q&A about the presentation topic
+- Substantive discussion of the presented material
+- Final summary points or key takeaways
+- Closing remarks that summarize content
+
+Return ONLY a single number: the index (0-based from the ORIGINAL transcript) of the LAST entry
+that is actual content. Everything AFTER this index will be removed.
+If content goes to the very end, return the last index number shown.
+
+Transcript (numbered by original index):
+{end_text}
+
+Return only the number (e.g., "85" or "102"):"""
+
+    end_idx = len(entries) - 1
+    try:
+        response = model.generate_content(
+            end_prompt,
+            generation_config=genai.GenerationConfig(temperature=0.1, max_output_tokens=10)
+        )
+        if response.text:
+            num_str = ''.join(c for c in response.text.strip() if c.isdigit())
+            if num_str:
+                parsed_end = int(num_str)
+                # Make sure it's within valid range
+                if end_offset <= parsed_end < len(entries):
+                    end_idx = parsed_end
+    except Exception as e:
+        if progress_callback:
+            progress_callback(f"  Warning: Could not trim end ({e})")
+        end_idx = len(entries) - 1
+
+    # Apply trimming
+    trimmed = entries[start_idx:end_idx + 1]
+
+    if progress_callback:
+        removed_start = start_idx
+        removed_end = len(entries) - 1 - end_idx
+        if removed_start > 0 or removed_end > 0:
+            progress_callback(f"  Removed {removed_start} entries from start, {removed_end} from end")
+        else:
+            progress_callback(f"  No fluff detected")
+
+    return trimmed
+
+
 def consolidate_speaker_entries(entries: List[Dict]) -> List[Dict]:
     """
     Consolidate consecutive entries from the same speaker into single entries.
@@ -1219,8 +1365,16 @@ def main():
     print(f"  [Slides] Found {len(slides)} slides")
     print(f"  [Transcript] Generated {len(transcript)} entries")
 
-    # Step 2: Clean up transcript and consolidate
+    # Step 2: Clean up transcript (trim fluff, identify speakers, consolidate)
     print("\n[2/4] Cleaning up transcript...")
+
+    # First, trim pre/post meeting fluff (setup chatter, goodbyes)
+    pre_trim_count = len(transcript)
+    transcript = trim_transcript_fluff(transcript, api_key, progress_callback=print_progress)
+    if len(transcript) < pre_trim_count:
+        print(f"  Trimmed {pre_trim_count - len(transcript)} fluff entries")
+
+    # Then clean up speaker names and fix transcription errors
     transcript = cleanup_transcript_entries(transcript, api_key, progress_callback=print_progress)
 
     # Consolidate consecutive entries from the same speaker
